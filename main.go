@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	// "gocv.io/x/gocv"
 	"golang.org/x/term"
 	"image"
 	"image/jpeg"
@@ -44,33 +43,34 @@ func renderProgressBar(current, total, width int) {
 	fmt.Printf("\rProcessing video %s %d/%d", bar, current, total)
 }
 
-// func processFrames(images []image.Image, videoCapture *gocv.VideoCapture) []image.Image {
-// 	totalFrames := int(videoCapture.Get(gocv.VideoCaptureFrameCount))
-// 	matFrame := gocv.NewMat()
-// 	defer matFrame.Close()
-//
-// 	current := 0
-// 	for {
-// 		if ok := videoCapture.Read(&matFrame); !ok {
-// 			fmt.Println("\nFinished processing video or cannot read frame.")
-// 			break
-// 		}
-// 		if matFrame.Empty() {
-// 			continue
-// 		}
-//
-// 		img, err := matFrame.ToImage()
-// 		if err != nil {
-// 			continue
-// 		}
-//
-// 		images = append(images, img)
-// 		current++
-// 		renderProgressBar(current, totalFrames, 40)
-// 	}
-//
-// 	return images
-// }
+func processFramesFromFolder(folderPath string) []image.Image {
+	files, err := os.ReadDir(folderPath)
+	if err != nil {
+		panic(err)
+	}
+
+	var images []image.Image
+	total := len(files)
+	for i, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		path := filepath.Join(folderPath, file.Name())
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		img, _, err := image.Decode(f)
+		f.Close()
+		if err != nil {
+			continue
+		}
+		images = append(images, img)
+		renderProgressBar(i+1, total, 40)
+	}
+
+	return images
+}
 
 func printAscii(img image.Image, width, height int) {
 	darkToLight := "@%#*+=-:. "
@@ -80,7 +80,6 @@ func printAscii(img image.Image, width, height int) {
 
 	imgWidth := bounds.Max.X - bounds.Min.X
 	imgHeight := bounds.Max.Y - bounds.Min.Y
-	fmt.Printf("Image size: %dx%d\n", imgWidth, imgHeight)
 
 	// get new width and height for image to fit in terminal
 
@@ -92,7 +91,6 @@ func printAscii(img image.Image, width, height int) {
 		newHeight = height
 		newWidth = int(float64(newHeight) * aspectRatio)
 	}
-	fmt.Printf("New size : %dx%d\n", newWidth, newHeight)
 
 	resizedImg := resizeImage(img, newWidth, newHeight)
 	imgWidth = resizedImg.Bounds().Max.X - resizedImg.Bounds().Min.X
@@ -148,7 +146,7 @@ func main() {
 	}
 	fmt.Printf("Width: %d, Height: %d\n", width, height)
 
-	file, err := os.Open("./test1.jpg")
+	file, err := os.Open("./frames")
 	if err != nil {
 		panic(err) // Or handle error more gracefully, e.g., log.Fatal(err)
 	}
@@ -180,16 +178,9 @@ func main() {
 		}
 		images = append(images, img)
 		fmt.Println("It's a PNG")
-	// case ".mp4", ".avi", ".mkv", ".mov":
-	// 	fmt.Println("It's a video")
-	// 	videoCapture, err := gocv.VideoCaptureFile(file.Name())
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// 	images = processFrames(images, videoCapture)
-
 	default:
-		panic("Unsupported file type")
+		folderPath := "./frames/"
+		images = processFramesFromFolder(folderPath)
 	}
 
 	frameRate := 60
