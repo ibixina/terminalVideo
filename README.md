@@ -36,3 +36,9 @@ The program uses the following Go packages:
 To install the `golang.org/x/term` package if you haven't already:
 ```bash
 go get golang.org/x/term
+```
+
+
+# TODO:
+- Add support for video
+- Add support for online sources: image and video
