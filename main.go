@@ -105,7 +105,10 @@ func printAscii(img image.Image, width, height int) {
 		return
 	}
 
+	lines := ""
+
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		line := ""
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			r, g, b, _ := resizedImg.At(x, y).RGBA() // Returns values in range [0, 0xFFFF]
 
@@ -127,10 +130,11 @@ func printAscii(img image.Image, width, height int) {
 
 			character := darkToLight[characterIndex]
 			// fmt.Printf("%d %d %d ", r8, g8, b8)
-			fmt.Printf("%c", character)
+			line += string(character)
 		}
-		fmt.Println()
+		lines += line + "\n"
 	}
+	fmt.Println(lines)
 }
 
 func main() {
@@ -146,7 +150,7 @@ func main() {
 	}
 	fmt.Printf("Width: %d, Height: %d\n", width, height)
 
-	file, err := os.Open("./na0maly_color2.jpg")
+	file, err := os.Open("./frames")
 	if err != nil {
 		panic(err) // Or handle error more gracefully, e.g., log.Fatal(err)
 	}
