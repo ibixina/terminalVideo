@@ -87,11 +87,11 @@ func printAscii(img image.Image, width, height int) {
 	newWidth := width
 	newHeight := int(float64(newWidth) / aspectRatio)
 
-	if newHeight > height {
-		newHeight = height
-		newWidth = int(float64(newHeight) * aspectRatio)
-	}
-
+	// if newHeight > height {
+	// 	newHeight = height
+	// 	newWidth = int(float64(newHeight) * aspectRatio)
+	// }
+	//
 	resizedImg := resizeImage(img, newWidth, newHeight)
 	imgWidth = resizedImg.Bounds().Max.X - resizedImg.Bounds().Min.X
 	imgHeight = resizedImg.Bounds().Max.Y - resizedImg.Bounds().Min.Y
@@ -146,7 +146,7 @@ func main() {
 	}
 	fmt.Printf("Width: %d, Height: %d\n", width, height)
 
-	file, err := os.Open("./frames")
+	file, err := os.Open("./na0maly_color2.jpg")
 	if err != nil {
 		panic(err) // Or handle error more gracefully, e.g., log.Fatal(err)
 	}
