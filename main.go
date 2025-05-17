@@ -183,7 +183,7 @@ func main() {
 		images = processFramesFromFolder(folderPath)
 	}
 
-	frameRate := 60
+	frameRate := 20
 	frameDelay := time.Duration(1000.0/frameRate) * time.Millisecond
 
 	for _, img := range images {
