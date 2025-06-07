@@ -227,7 +227,9 @@ func processImage(img image.Image) image.Image {
 
 func printAscii(img image.Image, width, height int) {
 	// darkToLight := "#%*+=-'. "
-	darkToLight := " .'-=+*%#"
+	// darkToLight := " .'-=+*%#⣿"
+
+	darkToLight := " #"
 	numCharsInRamp := len(darkToLight)
 
 	bounds := img.Bounds()
