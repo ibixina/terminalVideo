@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -153,6 +154,36 @@ func processFramesFromFolder(folderPath string) []image.Image {
 	}
 
 	return result
+}
+
+// extractFramesFromVideo extracts frames from an MP4 video using ffmpeg
+// Returns the path to the temporary directory containing the frames
+func extractFramesFromVideo(videoPath string) (string, error) {
+	// Create temporary directory for frames
+	tempDir, err := os.MkdirTemp("", "terminalvideo-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	// Extract frames at 30fps using ffmpeg
+	framePattern := filepath.Join(tempDir, "frame_%05d.jpg")
+
+	fmt.Printf("Extracting frames from %s...\n", videoPath)
+
+	cmd := exec.Command("ffmpeg",
+		"-i", videoPath,
+		"-vf", "fps=30,scale=480:-1:flags=lanczos",
+		"-q:v", "2",
+		framePattern,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return "", fmt.Errorf("ffmpeg failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return tempDir, nil
 }
 
 func processImage(img image.Image) image.Image {
@@ -317,6 +348,7 @@ func main() {
 	}
 
 	var images []image.Image
+	var tempDir string
 
 	if fileInfo.IsDir() {
 		// Process directory of frames
@@ -350,11 +382,27 @@ func main() {
 			}
 			images = append(images, img)
 			fmt.Println("Loaded PNG")
+		case ".mp4", ".webm", ".mov", ".avi":
+			// Extract frames from video
+			tempDir, err = extractFramesFromVideo(inputPath)
+			if err != nil {
+				fmt.Printf("Error extracting frames: %v\n", err)
+				fmt.Println("Make sure ffmpeg is installed: sudo apt install ffmpeg")
+				os.Exit(1)
+			}
+			// Process extracted frames
+			images = processFramesFromFolder(tempDir)
+			fmt.Println() // New line after progress bar
 		default:
 			fmt.Printf("Error: unsupported file format '%s'\n", ext)
-			fmt.Println("Supported formats: .jpg, .jpeg, .png")
+			fmt.Println("Supported formats: .jpg, .jpeg, .png, .mp4, .webm, .mov, .avi")
 			os.Exit(1)
 		}
+	}
+
+	// Cleanup temp directory if created
+	if tempDir != "" {
+		defer os.RemoveAll(tempDir)
 	}
 
 	if len(images) == 0 {
