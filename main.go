@@ -215,7 +215,7 @@ func streamVideoFrames(videoPath string) (<-chan image.Image, chan error) {
 		framePattern := filepath.Join(tempDir, "frame_%05d.jpg")
 		cmd := exec.Command("ffmpeg",
 			"-i", videoPath,
-			"-vf", "fps=30,scale=480:-1:flags=lanczos",
+			"-vf", "fps=30,scale=1280:-1:flags=lanczos",
 			"-q:v", "2",
 			framePattern,
 		)
@@ -339,19 +339,20 @@ func printAscii(img image.Image, width, height int) {
 	imgHeight := bounds.Dy()
 
 	// Calculate target dimensions to fill terminal while preserving aspect ratio
-	// Terminal chars are ~2x taller than wide, so we compensate
+	// Terminal chars are ~2x taller than wide, so we need to compensate
 	charAspectRatio := 2.0 // height/width of a terminal character
 	imageAspectRatio := float64(imgWidth) / float64(imgHeight)
 
-	// Scale image to fit within terminal, accounting for character aspect ratio
-	scaledAspectRatio := imageAspectRatio / charAspectRatio
-
+	// First calculate height based on full terminal width
 	newWidth := width
-	newHeight := int(float64(newWidth) / scaledAspectRatio)
+	// Calculate height accounting for character aspect ratio
+	// If image is 16:9, and chars are 2:1, the effective aspect is (16/9)/2 = 0.89
+	newHeight := int(float64(newWidth) / imageAspectRatio * charAspectRatio)
 
+	// If height exceeds terminal, scale down to fit height
 	if newHeight > height {
 		newHeight = height
-		newWidth = int(float64(newHeight) * scaledAspectRatio)
+		newWidth = int(float64(newHeight) * imageAspectRatio / charAspectRatio)
 	}
 
 	resizedImg := resizeImage(img, newWidth, newHeight)
