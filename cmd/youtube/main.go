@@ -145,16 +145,18 @@ func downloadYouTubeVideo(url string) (string, error) {
 
 	fmt.Printf("Selected quality: %s\n", bestFormat.QualityLabel)
 
-	tempFile, err := os.CreateTemp("", "youtube-*.mp4")
+	// Create video file in current directory directly
+	videoPath := "./youtube_video.mp4"
+	videoFile, err := os.Create(videoPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %w", err)
+		return "", fmt.Errorf("failed to create video file: %w", err)
 	}
-	defer tempFile.Close()
+	defer videoFile.Close()
 
 	fmt.Println("Downloading...")
 	stream, _, err := client.GetStream(video, bestFormat)
 	if err != nil {
-		os.Remove(tempFile.Name())
+		os.Remove(videoPath)
 		return "", fmt.Errorf("failed to get stream: %w", err)
 	}
 	defer stream.Close()
@@ -164,20 +166,37 @@ func downloadYouTubeVideo(url string) (string, error) {
 	for {
 		n, err := stream.Read(buffer)
 		if n > 0 {
-			tempFile.Write(buffer[:n])
+			videoFile.Write(buffer[:n])
 			totalBytes += int64(n)
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			os.Remove(tempFile.Name())
+			os.Remove(videoPath)
 			return "", fmt.Errorf("download error: %w", err)
 		}
 	}
 
 	fmt.Printf("Downloaded %d MB\n", totalBytes/1024/1024)
-	return tempFile.Name(), nil
+	return videoPath, nil
+}
+
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	return err
 }
 
 func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
@@ -200,40 +219,38 @@ func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
 		framePattern := filepath.Join(framesDir, "frame_%05d.jpg")
 
 		fmt.Println("Extracting frames...")
+
+		// Check if video file exists
+		if _, err := os.Stat(videoPath); os.IsNotExist(err) {
+			errChan <- fmt.Errorf("video file does not exist: %s", videoPath)
+			return
+		}
+
+		// Run ffmpeg and capture output
 		cmd := exec.Command("ffmpeg",
-			"-hide_banner",
-			"-loglevel", "error",
 			"-i", videoPath,
-			"-vf", "fps=30,scale=720:-1:flags=lanczos",
+			"-vf", "fps=30,scale=480:-1:flags=lanczos",
 			"-pix_fmt", "yuvj420p",
 			"-q:v", "2",
 			framePattern,
 		)
 
-		stderr, err := cmd.StderrPipe()
+		output, err := cmd.CombinedOutput()
 		if err != nil {
-			errChan <- fmt.Errorf("failed to create stderr pipe: %w", err)
+			fmt.Fprintf(os.Stderr, "ffmpeg error: %v\nOutput: %s\n", err, string(output))
+			errChan <- fmt.Errorf("ffmpeg failed: %w", err)
 			return
 		}
 
-		if err := cmd.Start(); err != nil {
-			errChan <- fmt.Errorf("failed to start ffmpeg: %w", err)
+		fmt.Printf("Extraction complete. Output: %s\n", string(output))
+
+		// List files in frames directory
+		files, err := os.ReadDir(framesDir)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to read frames directory: %w", err)
 			return
 		}
-
-		// Read stderr in background
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, err := stderr.Read(buf)
-				if n > 0 {
-					fmt.Fprintf(os.Stderr, "ffmpeg: %s", buf[:n])
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
+		fmt.Printf("Found %d files in frames directory\n", len(files))
 
 		frameNum := 1
 		consecutiveEmpty := 0
