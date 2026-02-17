@@ -338,25 +338,39 @@ func printAscii(img image.Image, width, height int) {
 	imgWidth := bounds.Dx()
 	imgHeight := bounds.Dy()
 
-	// Calculate target dimensions to fill terminal while preserving aspect ratio
-	// Terminal chars are ~2x taller than wide, so we need to compensate
-	charAspectRatio := 2.0 // height/width of a terminal character
+	// Calculate target dimensions to fit terminal while preserving aspect ratio
+	// Terminal chars are ~2x taller than wide (height/width ≈ 2.0)
+	// Visual aspect = (newWidth * charWidth) / (newHeight * charHeight)
+	//               = newWidth / (newHeight * 2.0)
+	// To match image aspect: newWidth / (newHeight * 2.0) = imgWidth / imgHeight
+	// Solving: newHeight = newWidth * imgHeight / imgWidth / 2.0
+	charAspectCorrection := 2.0
 	imageAspectRatio := float64(imgWidth) / float64(imgHeight)
 
-	// First try to use full terminal width
+	// Calculate dimensions that fit within terminal bounds
+	// Try width-first: use full terminal width
 	newWidth := width
-	// Calculate height: visual_height = width / imageAspect / charAspect
-	// Because if chars are 2x taller, we need half as many rows
-	newHeight := int(float64(newWidth) / imageAspectRatio / charAspectRatio)
+	newHeight := int(float64(newWidth) / imageAspectRatio / charAspectCorrection)
 
-	// If height exceeds available space, scale to fit height instead
+	// If that doesn't fit vertically, scale to fit height instead
 	if newHeight > height {
 		newHeight = height
-		newWidth = int(float64(newHeight) * imageAspectRatio * charAspectRatio)
+		newWidth = int(float64(newHeight) * imageAspectRatio * charAspectCorrection)
 	}
 
-	// Debug: Show calculated dimensions
-	// fmt.Printf("\rDebug: img=%dx%d term=%dx%d -> new=%dx%d", imgWidth, imgHeight, width, height, newWidth, newHeight)
+	// Ensure we don't exceed terminal bounds
+	if newWidth > width {
+		newWidth = width
+	}
+	if newHeight > height {
+		newHeight = height
+	}
+	if newWidth < 1 {
+		newWidth = 1
+	}
+	if newHeight < 1 {
+		newHeight = 1
+	}
 
 	resizedImg := resizeImage(img, newWidth, newHeight)
 	processedImg := processImage(resizedImg)
