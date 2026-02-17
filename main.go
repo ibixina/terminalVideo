@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -156,8 +157,8 @@ func processFramesFromFolder(folderPath string) []image.Image {
 	return result
 }
 
-// extractFramesFromVideo extracts frames from an MP4 video using ffmpeg
-// Returns the path to the temporary directory containing the frames
+// extractFramesFromVideo extracts frames from a video using ffmpeg
+// Returns the temp directory path and starts extraction in background
 func extractFramesFromVideo(videoPath string) (string, error) {
 	// Create temporary directory for frames
 	tempDir, err := os.MkdirTemp("", "terminalvideo-*")
@@ -168,7 +169,7 @@ func extractFramesFromVideo(videoPath string) (string, error) {
 	// Extract frames at 30fps using ffmpeg
 	framePattern := filepath.Join(tempDir, "frame_%05d.jpg")
 
-	fmt.Printf("Extracting frames from %s...\n", videoPath)
+	fmt.Printf("Starting extraction from %s...\n", videoPath)
 
 	cmd := exec.Command("ffmpeg",
 		"-i", videoPath,
@@ -177,13 +178,106 @@ func extractFramesFromVideo(videoPath string) (string, error) {
 		framePattern,
 	)
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	// Start ffmpeg in background
+	if err := cmd.Start(); err != nil {
 		os.RemoveAll(tempDir)
-		return "", fmt.Errorf("ffmpeg failed: %w\nOutput: %s", err, string(output))
+		return "", fmt.Errorf("failed to start ffmpeg: %w", err)
 	}
 
+	// Store cmd in temp file so we can check when it's done
+	// Actually, let's just let it run and monitor files
+	go func() {
+		cmd.Wait()
+	}()
+
 	return tempDir, nil
+}
+
+// streamVideoFrames streams frames from a video file as they're extracted
+// Returns a channel that yields images and a done channel
+func streamVideoFrames(videoPath string) (<-chan image.Image, chan error) {
+	imgChan := make(chan image.Image, 30) // Buffer 1 second of frames
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer close(imgChan)
+		defer close(errChan)
+
+		// Create temp directory
+		tempDir, err := os.MkdirTemp("", "terminalvideo-*")
+		if err != nil {
+			errChan <- fmt.Errorf("failed to create temp directory: %w", err)
+			return
+		}
+		defer os.RemoveAll(tempDir)
+
+		// Start ffmpeg extracting frames
+		framePattern := filepath.Join(tempDir, "frame_%05d.jpg")
+		cmd := exec.Command("ffmpeg",
+			"-i", videoPath,
+			"-vf", "fps=30,scale=480:-1:flags=lanczos",
+			"-q:v", "2",
+			framePattern,
+		)
+
+		if err := cmd.Start(); err != nil {
+			errChan <- fmt.Errorf("failed to start ffmpeg: %w", err)
+			return
+		}
+
+		// Wait for first frame to appear, then start streaming
+		frameNum := 1
+		consecutiveEmpty := 0
+		maxConsecutiveEmpty := 10 // Stop after 10 empty checks after ffmpeg exits
+
+		for {
+			framePath := filepath.Join(tempDir, fmt.Sprintf("frame_%05d.jpg", frameNum))
+
+			// Try to load the frame
+			if _, err := os.Stat(framePath); err == nil {
+				// Frame exists, try to load it
+				f, err := os.Open(framePath)
+				if err != nil {
+					consecutiveEmpty++
+				} else {
+					img, _, err := image.Decode(f)
+					f.Close()
+					if err != nil {
+						consecutiveEmpty++
+					} else {
+						imgChan <- img
+						frameNum++
+						consecutiveEmpty = 0
+						continue
+					}
+				}
+			} else {
+				consecutiveEmpty++
+			}
+
+			// Check if ffmpeg is still running
+			if cmd.Process != nil {
+				if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+					// Process is not running
+					if consecutiveEmpty > maxConsecutiveEmpty {
+						break
+					}
+				}
+			}
+
+			// Small delay before checking again
+			time.Sleep(10 * time.Millisecond)
+
+			if consecutiveEmpty > maxConsecutiveEmpty*3 {
+				break
+			}
+		}
+
+		// Wait for ffmpeg to finish
+		cmd.Wait()
+	}()
+
+	return imgChan, errChan
 }
 
 func processImage(img image.Image) image.Image {
@@ -347,16 +441,61 @@ func main() {
 		os.Exit(1)
 	}
 
+	ext := strings.ToLower(filepath.Ext(inputPath))
+
+	// Handle video files with streaming
+	if !fileInfo.IsDir() && (ext == ".mp4" || ext == ".webm" || ext == ".mov" || ext == ".avi") {
+		fmt.Printf("Streaming video: %s\n", inputPath)
+
+		// Start streaming frames from video
+		imgChan, errChan := streamVideoFrames(inputPath)
+
+		frameRate := 30 // Match ffmpeg extraction rate
+		frameDelay := time.Duration(1000.0/float64(frameRate)) * time.Millisecond
+
+		frameCount := 0
+		startTime := time.Now()
+
+		// Wait for at least a few frames before starting
+		time.Sleep(100 * time.Millisecond)
+
+		for {
+			select {
+			case img, ok := <-imgChan:
+				if !ok {
+					// Channel closed, video finished
+					fmt.Printf("\nPlayback complete. %d frames displayed in %v\n", frameCount, time.Since(startTime).Round(time.Second))
+					return
+				}
+				clearScreen()
+				printAscii(img, width, height)
+				frameCount++
+
+				// Show progress every 30 frames
+				if frameCount%30 == 0 {
+					fmt.Printf("\rFrame: %d | Time: %v", frameCount, time.Since(startTime).Round(time.Second))
+				}
+
+				time.Sleep(frameDelay)
+
+			case err := <-errChan:
+				if err != nil {
+					fmt.Printf("\nError: %v\n", err)
+					return
+				}
+			}
+		}
+	}
+
+	// Handle static content (images and directories)
 	var images []image.Image
-	var tempDir string
 
 	if fileInfo.IsDir() {
 		// Process directory of frames
 		images = processFramesFromFolder(inputPath)
 		fmt.Println() // New line after progress bar
 	} else {
-		// Process single file
-		ext := strings.ToLower(filepath.Ext(inputPath))
+		// Process single image file
 		switch ext {
 		case ".jpg", ".jpeg":
 			file, err := os.Open(inputPath)
@@ -382,27 +521,11 @@ func main() {
 			}
 			images = append(images, img)
 			fmt.Println("Loaded PNG")
-		case ".mp4", ".webm", ".mov", ".avi":
-			// Extract frames from video
-			tempDir, err = extractFramesFromVideo(inputPath)
-			if err != nil {
-				fmt.Printf("Error extracting frames: %v\n", err)
-				fmt.Println("Make sure ffmpeg is installed: sudo apt install ffmpeg")
-				os.Exit(1)
-			}
-			// Process extracted frames
-			images = processFramesFromFolder(tempDir)
-			fmt.Println() // New line after progress bar
 		default:
 			fmt.Printf("Error: unsupported file format '%s'\n", ext)
 			fmt.Println("Supported formats: .jpg, .jpeg, .png, .mp4, .webm, .mov, .avi")
 			os.Exit(1)
 		}
-	}
-
-	// Cleanup temp directory if created
-	if tempDir != "" {
-		defer os.RemoveAll(tempDir)
 	}
 
 	if len(images) == 0 {
@@ -411,7 +534,7 @@ func main() {
 	}
 
 	frameRate := 50
-	frameDelay := time.Duration(1000.0/frameRate) * time.Millisecond
+	frameDelay := time.Duration(1000.0/float64(frameRate)) * time.Millisecond
 
 	for _, img := range images {
 		clearScreen()
