@@ -343,17 +343,20 @@ func printAscii(img image.Image, width, height int) {
 	charAspectRatio := 2.0 // height/width of a terminal character
 	imageAspectRatio := float64(imgWidth) / float64(imgHeight)
 
-	// First calculate height based on full terminal width
+	// First try to use full terminal width
 	newWidth := width
-	// Calculate height accounting for character aspect ratio
-	// If image is 16:9, and chars are 2:1, the effective aspect is (16/9)/2 = 0.89
-	newHeight := int(float64(newWidth) / imageAspectRatio * charAspectRatio)
+	// Calculate height: visual_height = width / imageAspect / charAspect
+	// Because if chars are 2x taller, we need half as many rows
+	newHeight := int(float64(newWidth) / imageAspectRatio / charAspectRatio)
 
-	// If height exceeds terminal, scale down to fit height
+	// If height exceeds available space, scale to fit height instead
 	if newHeight > height {
 		newHeight = height
-		newWidth = int(float64(newHeight) * imageAspectRatio / charAspectRatio)
+		newWidth = int(float64(newHeight) * imageAspectRatio * charAspectRatio)
 	}
+
+	// Debug: Show calculated dimensions
+	// fmt.Printf("\rDebug: img=%dx%d term=%dx%d -> new=%dx%d", imgWidth, imgHeight, width, height, newWidth, newHeight)
 
 	resizedImg := resizeImage(img, newWidth, newHeight)
 	processedImg := processImage(resizedImg)
