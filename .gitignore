@@ -24,3 +24,12 @@ go.work.sum
 # Agent configuration
 AGENTS.md
 .gitignore
+
+# youtube command temp files and binaries
+cmd/youtube/youtube
+cmd/youtube/youtube_video.mp4
+cmd/youtube/youtube_frames/
+youtube_video.mp4
+youtube_frames/
+main
+terminalvideo

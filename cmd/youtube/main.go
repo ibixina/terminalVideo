@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
+	_ "image/jpeg"
 	"io"
 	"math"
 	"os"
@@ -69,16 +70,16 @@ func main() {
 	height = height - 1
 	fmt.Printf("Terminal: %dx%d | Loading YouTube: %s\n", width, height, videoURL)
 
-	videoPath, err := downloadYouTubeVideo(videoURL)
+	// Get YouTube stream
+	_, _, stream, err := getYouTubeStream(videoURL)
 	if err != nil {
-		fmt.Printf("Error downloading video: %v\n", err)
+		fmt.Printf("Error getting stream: %v\n", err)
 		os.Exit(1)
 	}
-	defer os.Remove(videoPath)
+	defer stream.Close()
 
-	fmt.Printf("Downloaded to: %s\n", videoPath)
-
-	imgChan, errChan := streamYouTubeFrames(videoPath)
+	// Start streaming frames directly from the video stream
+	imgChan, errChan := streamYouTubeFramesFromStream(stream)
 
 	frameRate := 30
 	frameDelay := time.Duration(1000.0/float64(frameRate)) * time.Millisecond
@@ -86,7 +87,7 @@ func main() {
 	frameCount := 0
 	startTime := time.Now()
 
-	// Wait longer for first frames to be extracted
+	// Short wait for first frames to be extracted
 	time.Sleep(500 * time.Millisecond)
 
 	for {
@@ -115,12 +116,12 @@ func main() {
 	}
 }
 
-func downloadYouTubeVideo(url string) (string, error) {
+func getYouTubeStream(url string) (*youtube.Video, *youtube.Format, io.ReadCloser, error) {
 	client := youtube.Client{}
 
 	video, err := client.GetVideo(url)
 	if err != nil {
-		return "", fmt.Errorf("failed to get video info: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to get video info: %w", err)
 	}
 
 	fmt.Printf("Title: %s\n", video.Title)
@@ -129,7 +130,7 @@ func downloadYouTubeVideo(url string) (string, error) {
 
 	formats := video.Formats.WithAudioChannels()
 	if len(formats) == 0 {
-		return "", fmt.Errorf("no video formats found")
+		return nil, nil, nil, fmt.Errorf("no video formats found")
 	}
 
 	var bestFormat *youtube.Format
@@ -144,42 +145,14 @@ func downloadYouTubeVideo(url string) (string, error) {
 	}
 
 	fmt.Printf("Selected quality: %s\n", bestFormat.QualityLabel)
+	fmt.Println("Starting playback...")
 
-	// Create video file in current directory directly
-	videoPath := "./youtube_video.mp4"
-	videoFile, err := os.Create(videoPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to create video file: %w", err)
-	}
-	defer videoFile.Close()
-
-	fmt.Println("Downloading...")
 	stream, _, err := client.GetStream(video, bestFormat)
 	if err != nil {
-		os.Remove(videoPath)
-		return "", fmt.Errorf("failed to get stream: %w", err)
-	}
-	defer stream.Close()
-
-	buffer := make([]byte, 32*1024)
-	totalBytes := int64(0)
-	for {
-		n, err := stream.Read(buffer)
-		if n > 0 {
-			videoFile.Write(buffer[:n])
-			totalBytes += int64(n)
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			os.Remove(videoPath)
-			return "", fmt.Errorf("download error: %w", err)
-		}
+		return nil, nil, nil, fmt.Errorf("failed to get stream: %w", err)
 	}
 
-	fmt.Printf("Downloaded %d MB\n", totalBytes/1024/1024)
-	return videoPath, nil
+	return video, bestFormat, stream, nil
 }
 
 func copyFile(src, dst string) error {
@@ -199,7 +172,7 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
+func streamYouTubeFramesFromStream(stream io.ReadCloser) (<-chan image.Image, chan error) {
 	imgChan := make(chan image.Image, 30)
 	errChan := make(chan error, 1)
 
@@ -220,85 +193,138 @@ func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
 
 		fmt.Println("Extracting frames...")
 
-		// Check if video file exists
-		if _, err := os.Stat(videoPath); os.IsNotExist(err) {
-			errChan <- fmt.Errorf("video file does not exist: %s", videoPath)
-			return
-		}
-
-		// Start ffmpeg in background
+		// Start ffmpeg with stdin input for streaming
 		cmd := exec.Command("ffmpeg",
 			"-hide_banner",
 			"-loglevel", "error",
-			"-i", videoPath,
+			"-i", "-", // Read from stdin
 			"-vf", "fps=30,scale=480:-1:flags=lanczos",
 			"-pix_fmt", "yuvj420p",
 			"-q:v", "2",
 			framePattern,
 		)
 
+		// Get stdin pipe to write video data
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			errChan <- fmt.Errorf("failed to get stdin pipe: %w", err)
+			return
+		}
+
+		// Start ffmpeg
 		if err := cmd.Start(); err != nil {
 			errChan <- fmt.Errorf("failed to start ffmpeg: %w", err)
 			return
 		}
 
-		// Give ffmpeg time to start extracting
-		time.Sleep(200 * time.Millisecond)
+		// Copy video stream to ffmpeg stdin in a separate goroutine
+		go func() {
+			defer stdin.Close()
+			io.Copy(stdin, stream)
+		}()
 
-		frameNum := 1
-		consecutiveEmpty := 0
-		maxConsecutiveEmpty := 30 // Allow more retries since ffmpeg is running
+		// Track processed frames
+		processedFrames := make(map[string]bool)
+		ffmpegExited := false
+		emptyIterations := 0
+		maxEmptyIterations := 600 // About 6 seconds of waiting
+		totalFramesSent := 0
 
 		for {
-			framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%05d.jpg", frameNum))
+			// Read all frame files from directory
+			entries, err := os.ReadDir(framesDir)
+			if err != nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
 
-			// Check if frame exists and is readable
-			if _, err := os.Stat(framePath); err == nil {
-				// Frame exists, try to load it
-				f, err := os.Open(framePath)
-				if err != nil {
-					consecutiveEmpty++
-				} else {
-					img, _, err := image.Decode(f)
-					f.Close()
-					// Remove frame after reading to save space
-					os.Remove(framePath)
-
-					if err != nil {
-						consecutiveEmpty++
-					} else {
-						imgChan <- img
-						frameNum++
-						consecutiveEmpty = 0
-						continue
+			// Find unprocessed frame files and sort them
+			var frameFiles []string
+			for _, entry := range entries {
+				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".jpg") {
+					framePath := filepath.Join(framesDir, entry.Name())
+					if !processedFrames[framePath] {
+						frameFiles = append(frameFiles, framePath)
 					}
 				}
-			} else {
-				consecutiveEmpty++
+			}
+
+			// Debug: print first time we find frames
+			if len(frameFiles) > 0 && totalFramesSent == 0 {
+				fmt.Printf("\nFound %d frames in directory\n", len(frameFiles))
+			}
+
+			// Sort frame files to process in order
+			// Note: frame_%05d.jpg sorts correctly alphabetically
+			for i := 0; i < len(frameFiles)-1; i++ {
+				for j := i + 1; j < len(frameFiles); j++ {
+					if frameFiles[i] > frameFiles[j] {
+						frameFiles[i], frameFiles[j] = frameFiles[j], frameFiles[i]
+					}
+				}
+			}
+
+			// Process available frames
+			framesProcessed := 0
+			for _, framePath := range frameFiles {
+				f, err := os.Open(framePath)
+				if err != nil {
+					fmt.Printf("\nError opening frame %s: %v\n", framePath, err)
+					continue
+				}
+
+				img, format, err := image.Decode(f)
+				f.Close()
+
+				if err != nil {
+					fmt.Printf("\nError decoding frame %s (format: %s): %v\n", framePath, format, err)
+					processedFrames[framePath] = true // Mark as processed even if decode fails
+					os.Remove(framePath)
+					continue
+				}
+
+				imgChan <- img
+				processedFrames[framePath] = true
+				os.Remove(framePath)
+				framesProcessed++
+				totalFramesSent++
+				emptyIterations = 0 // Reset empty counter when we process frames
+			}
+
+			// Debug: print progress every 30 frames
+			if totalFramesSent > 0 && totalFramesSent%30 == 0 && framesProcessed > 0 {
+				fmt.Printf("\rSent %d frames...", totalFramesSent)
 			}
 
 			// Check if ffmpeg has finished
-			if cmd.Process != nil {
-				// Try to check if process is still running
+			if cmd.Process != nil && !ffmpegExited {
 				if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-					// Process has exited
-					if consecutiveEmpty > maxConsecutiveEmpty {
-						// Wait a bit more then break
-						time.Sleep(100 * time.Millisecond)
-						break
-					}
+					ffmpegExited = true
+					fmt.Printf("\nFFmpeg finished, processed %d frames total\n", totalFramesSent)
 				}
 			}
 
-			time.Sleep(5 * time.Millisecond)
+			// If no new frames were found this iteration
+			if framesProcessed == 0 {
+				emptyIterations++
+			}
 
-			if consecutiveEmpty > maxConsecutiveEmpty*5 {
+			// Exit conditions
+			if ffmpegExited && emptyIterations > 100 {
+				// FFmpeg done and no new frames for ~1 second
+				fmt.Printf("\nFinished processing %d frames\n", totalFramesSent)
 				break
 			}
+
+			if !ffmpegExited && emptyIterations > maxEmptyIterations {
+				// Timeout waiting for frames
+				fmt.Printf("\nWarning: Timeout waiting for frames (found %d frames)\n", totalFramesSent)
+				break
+			}
+
+			time.Sleep(10 * time.Millisecond)
 		}
 
-		// Cleanup remaining frames
-		os.RemoveAll(framesDir)
 		cmd.Wait()
 	}()
 
