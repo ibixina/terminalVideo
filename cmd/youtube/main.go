@@ -86,7 +86,8 @@ func main() {
 	frameCount := 0
 	startTime := time.Now()
 
-	time.Sleep(100 * time.Millisecond)
+	// Wait longer for first frames to be extracted
+	time.Sleep(500 * time.Millisecond)
 
 	for {
 		select {
@@ -187,34 +188,59 @@ func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
 		defer close(imgChan)
 		defer close(errChan)
 
-		tempDir, err := os.MkdirTemp("", "youtube-frames-*")
+		// Create frames directory in current working directory
+		framesDir := "./youtube_frames"
+		err := os.MkdirAll(framesDir, 0755)
 		if err != nil {
-			errChan <- fmt.Errorf("failed to create temp directory: %w", err)
+			errChan <- fmt.Errorf("failed to create frames directory: %w", err)
 			return
 		}
-		defer os.RemoveAll(tempDir)
+		defer os.RemoveAll(framesDir)
 
-		framePattern := filepath.Join(tempDir, "frame_%05d.jpg")
+		framePattern := filepath.Join(framesDir, "frame_%05d.jpg")
 
 		fmt.Println("Extracting frames...")
 		cmd := exec.Command("ffmpeg",
+			"-hide_banner",
+			"-loglevel", "error",
 			"-i", videoPath,
-			"-vf", "fps=30,scale=1280:-1:flags=lanczos",
+			"-vf", "fps=30,scale=720:-1:flags=lanczos",
+			"-pix_fmt", "yuvj420p",
 			"-q:v", "2",
 			framePattern,
 		)
+
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			errChan <- fmt.Errorf("failed to create stderr pipe: %w", err)
+			return
+		}
 
 		if err := cmd.Start(); err != nil {
 			errChan <- fmt.Errorf("failed to start ffmpeg: %w", err)
 			return
 		}
 
+		// Read stderr in background
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, err := stderr.Read(buf)
+				if n > 0 {
+					fmt.Fprintf(os.Stderr, "ffmpeg: %s", buf[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+		}()
+
 		frameNum := 1
 		consecutiveEmpty := 0
 		maxConsecutiveEmpty := 10
 
 		for {
-			framePath := filepath.Join(tempDir, fmt.Sprintf("frame_%05d.jpg", frameNum))
+			framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%05d.jpg", frameNum))
 
 			if _, err := os.Stat(framePath); err == nil {
 				f, err := os.Open(framePath)
