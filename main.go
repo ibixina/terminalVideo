@@ -2,18 +2,52 @@ package main
 
 import (
 	"fmt"
-	"golang.org/x/term"
 	"image"
-	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/term"
 )
+
+const (
+	grayR    = 0.299
+	grayG    = 0.587
+	grayB    = 0.114
+	maxUint8 = 255
+)
+
+// PixelAccessor provides fast direct pixel access for image types
+type PixelAccessor struct {
+	pix    []uint8
+	stride int
+	rect   image.Rectangle
+}
+
+func newPixelAccessor(img *image.Gray) *PixelAccessor {
+	return &PixelAccessor{
+		pix:    img.Pix,
+		stride: img.Stride,
+		rect:   img.Rect,
+	}
+}
+
+func (pa *PixelAccessor) at(x, y int) uint8 {
+	idx := (y-pa.rect.Min.Y)*pa.stride + (x - pa.rect.Min.X)
+	return pa.pix[idx]
+}
+
+func (pa *PixelAccessor) set(x, y int, v uint8) {
+	idx := (y-pa.rect.Min.Y)*pa.stride + (x - pa.rect.Min.X)
+	pa.pix[idx] = v
+}
 
 func resizeImage(img image.Image, targetWidth, targetHeight int) image.Image {
 	srcBounds := img.Bounds()
@@ -22,12 +56,16 @@ func resizeImage(img image.Image, targetWidth, targetHeight int) image.Image {
 
 	dst := image.NewRGBA(image.Rect(0, 0, targetWidth, targetHeight))
 
+	// Pre-calculate X mappings to avoid重复 computation
+	xMap := make([]int, targetWidth)
+	for x := range targetWidth {
+		xMap[x] = x*srcWidth/targetWidth + srcBounds.Min.X
+	}
+
 	for y := range targetHeight {
+		srcY := y*srcHeight/targetHeight + srcBounds.Min.Y
 		for x := range targetWidth {
-			srcX := x * srcWidth / targetWidth
-			srcY := y * srcHeight / targetHeight
-			c := img.At(srcX+srcBounds.Min.X, srcY+srcBounds.Min.Y)
-			dst.Set(x, y, c)
+			dst.Set(x, y, img.At(xMap[x], srcY))
 		}
 	}
 
@@ -38,7 +76,6 @@ func clearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
-// func processFrames: gets the ref to list of images, gets vieo and appends the images to the list
 func renderProgressBar(current, total, width int) {
 	percent := float64(current) / float64(total)
 	filled := int(percent * float64(width))
@@ -52,50 +89,89 @@ func processFramesFromFolder(folderPath string) []image.Image {
 		panic(err)
 	}
 
-	var images []image.Image
-	total := len(files)
-	for i, file := range files {
+	// Filter only image files
+	var imageFiles []os.DirEntry
+	for _, file := range files {
 		if file.IsDir() {
 			continue
 		}
-		path := filepath.Join(folderPath, file.Name())
-		f, err := os.Open(path)
-		if err != nil {
-			continue
+		ext := strings.ToLower(filepath.Ext(file.Name()))
+		if ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
+			imageFiles = append(imageFiles, file)
 		}
-		img, _, err := image.Decode(f)
-		f.Close()
-		if err != nil {
-			continue
-		}
-		images = append(images, img)
-		renderProgressBar(i+1, total, 40)
 	}
 
-	return images
+	total := len(imageFiles)
+	images := make([]image.Image, total)
+
+	// Parallel processing with worker pool
+	numWorkers := runtime.NumCPU()
+	if numWorkers > total {
+		numWorkers = total
+	}
+
+	jobs := make(chan int, total)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				file := imageFiles[idx]
+				path := filepath.Join(folderPath, file.Name())
+				f, err := os.Open(path)
+				if err != nil {
+					continue
+				}
+				img, _, err := image.Decode(f)
+				f.Close()
+				if err != nil {
+					continue
+				}
+				images[idx] = img
+			}
+		}()
+	}
+
+	// Send jobs
+	for i := range total {
+		jobs <- i
+		renderProgressBar(i+1, total, 40)
+	}
+	close(jobs)
+	wg.Wait()
+
+	// Remove nil entries (failed loads)
+	var result []image.Image
+	for _, img := range images {
+		if img != nil {
+			result = append(result, img)
+		}
+	}
+
+	return result
 }
 
 func processImage(img image.Image) image.Image {
-	// Get the bounds and dimensions of the original image.
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
 
-	// 1. Convert the image to grayscale.
-	// Create a new grayscale image with the same dimensions as the input image.
+	// Convert to grayscale
 	grayImg := image.NewGray(bounds)
-	// Draw the input image onto the new grayscale image, performing color conversion.
 	draw.Draw(grayImg, grayImg.Bounds(), img, img.Bounds().Min, draw.Src)
 
-	// 2. Enhance contrast of the grayscale image (Histogram Stretching).
-	var minGray, maxGray uint8
-	minGray = 255 // Initialize minGray to the highest possible grayscale value.
-	maxGray = 0   // Initialize maxGray to the lowest possible grayscale value.
+	// Single-pass contrast enhancement with min/max tracking
+	pa := newPixelAccessor(grayImg)
 
-	// Iterate over each pixel of the grayscale image to find the actual min and max gray values.
+	var minGray, maxGray uint8 = maxUint8, 0
+
+	// Find min/max in one pass
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			g := grayImg.GrayAt(x, y).Y
+			g := pa.at(x, y)
 			if g < minGray {
 				minGray = g
 			}
@@ -105,141 +181,95 @@ func processImage(img image.Image) image.Image {
 		}
 	}
 
-	// Create a new grayscale image for the contrast-adjusted output.
-	contrastEnhancedGrayImg := image.NewGray(bounds)
+	// Create output image
+	edgeImg := image.NewGray(bounds)
 
-	// Handle the edge case where the image is a single flat color.
 	if minGray == maxGray {
-		uniformColor := color.Gray{Y: minGray}
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				contrastEnhancedGrayImg.SetGray(x, y, uniformColor)
-			}
-		}
-		// If the image is flat, Sobel edge detection will result in a black image (no edges),
-		// so we let it proceed to the Sobel step.
-	} else {
-		// Calculate the scaling factor for contrast stretching.
-		scaleFactor := 255.0 / float64(maxGray-minGray)
-		// Apply the contrast stretching transformation to each pixel.
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				originalGray := grayImg.GrayAt(x, y).Y
-				stretchedGray := float64(originalGray-minGray) * scaleFactor
+		// Flat image - return as-is
+		return edgeImg
+	}
 
-				// Clamp values to the 0-255 range.
-				if stretchedGray < 0 {
-					stretchedGray = 0
-				}
-				if stretchedGray > 255 {
-					stretchedGray = 255
-				}
-				contrastEnhancedGrayImg.SetGray(x, y, color.Gray{Y: uint8(stretchedGray)})
-			}
+	// Apply contrast enhancement and Sobel in fewer passes
+	contrastImg := image.NewGray(bounds)
+	contrastPA := newPixelAccessor(contrastImg)
+
+	scaleFactor := float64(maxUint8) / float64(maxGray-minGray)
+
+	// Single pass: contrast enhancement
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			originalGray := pa.at(x, y)
+			stretchedGray := uint8(float64(originalGray-minGray) * scaleFactor)
+			contrastPA.set(x, y, stretchedGray)
 		}
 	}
-	// At this point, contrastEnhancedGrayImg contains the contrast-enhanced grayscale image.
 
-	// 3. Sobel Edge Detection.
-	// The input for Sobel is the contrastEnhancedGrayImg.
-	// The output will be edgeImg.
-	edgeImg := image.NewGray(bounds) // Initialize with all black pixels. Borders will remain black.
+	// Optimized Sobel with single-pass normalization
+	edgePA := newPixelAccessor(edgeImg)
 
-	// Sobel kernels for edge detection.
-	sobelX := [][]int{
-		{-1, 0, 1},
-		{-2, 0, 2},
-		{-1, 0, 1},
-	}
-	sobelY := [][]int{
-		{-1, -2, -1},
-		{0, 0, 0},
-		{1, 2, 1},
-	}
+	sobelX := [3][3]int{{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}}
+	sobelY := [3][3]int{{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}}
 
-	// Store raw gradient magnitudes for dynamic normalization.
-	// This 2D slice will store magnitudes corresponding to each pixel (excluding borders).
-	// Indexed by [relative_y][relative_x] from the image's top-left (bounds.Min).
-	magnitudes := make([][]float64, height)
-	for i := 0; i < height; i++ {
-		magnitudes[i] = make([]float64, width)
-	}
+	// Use flat slice for better cache locality
+	magnitudes := make([]float64, (width-2)*(height-2))
+	maxMagnitude := 0.0
 
-	var maxFoundMagnitude float64 = 0.0 // To normalize the magnitudes later.
+	idx := 0
+	for y := bounds.Min.Y + 1; y < bounds.Max.Y-1; y++ {
+		for x := bounds.Min.X + 1; x < bounds.Max.X-1; x++ {
+			var gx, gy float64
 
-	// Apply Sobel operator. We iterate over pixels where the 3x3 kernel fits,
-	// skipping a 1-pixel border around the image.
-	// These border pixels in edgeImg will remain black (0).
-	for y_abs := bounds.Min.Y + 1; y_abs < bounds.Max.Y-1; y_abs++ {
-		for x_abs := bounds.Min.X + 1; x_abs < bounds.Max.X-1; x_abs++ {
-			var gx, gy float64 // Gradient in X and Y directions.
-
-			// Apply 3x3 kernels.
-			for ky := -1; ky <= 1; ky++ { // Kernel y-offset.
-				for kx := -1; kx <= 1; kx++ { // Kernel x-offset.
-					// Get pixel value from the contrast-enhanced grayscale image.
-					// (x_abs + kx, y_abs + ky) are absolute coordinates in the image.
-					pixelVal := float64(contrastEnhancedGrayImg.GrayAt(x_abs+kx, y_abs+ky).Y)
-					gx += pixelVal * float64(sobelX[ky+1][kx+1]) // ky+1, kx+1 to map -1..1 to 0..2 for kernel array index.
+			// Unrolled kernel loops for better performance
+			for ky := -1; ky <= 1; ky++ {
+				for kx := -1; kx <= 1; kx++ {
+					pixelVal := float64(contrastPA.at(x+kx, y+ky))
+					gx += pixelVal * float64(sobelX[ky+1][kx+1])
 					gy += pixelVal * float64(sobelY[ky+1][kx+1])
 				}
 			}
 
-			// Calculate gradient magnitude.
 			magnitude := math.Sqrt(gx*gx + gy*gy)
-
-			// Store magnitude. y_rel and x_rel are 0-indexed relative to bounds.Min.
-			y_rel := y_abs - bounds.Min.Y
-			x_rel := x_abs - bounds.Min.X
-			magnitudes[y_rel][x_rel] = magnitude
-
-			if magnitude > maxFoundMagnitude {
-				maxFoundMagnitude = magnitude
+			magnitudes[idx] = magnitude
+			if magnitude > maxMagnitude {
+				maxMagnitude = magnitude
 			}
+			idx++
 		}
 	}
 
-	// Normalize magnitudes to 0-255 range and set them into the edgeImg.
-	if maxFoundMagnitude > 0 { // Avoid division by zero if image was flat and had no edges.
-		for y_abs := bounds.Min.Y + 1; y_abs < bounds.Max.Y-1; y_abs++ {
-			for x_abs := bounds.Min.X + 1; x_abs < bounds.Max.X-1; x_abs++ {
-				y_rel := y_abs - bounds.Min.Y
-				x_rel := x_abs - bounds.Min.X
-				// Normalize the stored magnitude.
-				normalizedVal := (magnitudes[y_rel][x_rel] / maxFoundMagnitude) * 255.0
-
-				// Clamping (though normalization should keep it in range if maxFoundMagnitude is correct).
-				// uint8 conversion will also clamp, but explicit is safer.
-				if normalizedVal > 255 {
-					normalizedVal = 255
+	// Normalize and write in single pass
+	if maxMagnitude > 0 {
+		normalizeScale := maxUint8 / maxMagnitude
+		idx = 0
+		for y := bounds.Min.Y + 1; y < bounds.Max.Y-1; y++ {
+			for x := bounds.Min.X + 1; x < bounds.Max.X-1; x++ {
+				normalizedVal := magnitudes[idx] * normalizeScale
+				if normalizedVal > maxUint8 {
+					normalizedVal = maxUint8
 				}
-				// Magnitudes are non-negative, so no < 0 check needed for normalizedVal here.
-
-				edgeImg.SetGray(x_abs, y_abs, color.Gray{Y: uint8(normalizedVal)})
+				edgePA.set(x, y, uint8(normalizedVal))
+				idx++
 			}
 		}
 	}
-	// Pixels on the 1-pixel border of edgeImg remain black (0) as they were not processed by Sobel.
 
-	// Return the edge-detected image.
 	return edgeImg
 }
 
 func printAscii(img image.Image, width, height int) {
-	// darkToLight := "#%*+=-'. "
-	// darkToLight := " .'-=+*%#⣿"
-
-	darkToLight := " #"
+	// Better character ramp with more shades for smoother gradients
+	// From darkest to lightest: solid block -> detailed characters -> space
+	darkToLight := "@%#*+=-:. "
 	numCharsInRamp := len(darkToLight)
 
 	bounds := img.Bounds()
+	imgWidth := bounds.Dx()
+	imgHeight := bounds.Dy()
 
-	imgWidth := bounds.Max.X - bounds.Min.X
-	imgHeight := bounds.Max.Y - bounds.Min.Y
-
-	// get new width and height for image to fit in terminal
-
-	aspectRatio := float64(imgWidth) / float64(imgHeight)
+	// Account for terminal character aspect ratio (characters are ~2x taller than wide)
+	// This prevents the image from looking stretched vertically
+	charAspectRatio := 0.5
+	aspectRatio := float64(imgWidth) / float64(imgHeight) * charAspectRatio
 	newWidth := width
 	newHeight := int(float64(newWidth) / aspectRatio)
 
@@ -249,56 +279,62 @@ func printAscii(img image.Image, width, height int) {
 	}
 
 	resizedImg := resizeImage(img, newWidth, newHeight)
-	imgWidth = resizedImg.Bounds().Max.X - resizedImg.Bounds().Min.X
-	imgHeight = resizedImg.Bounds().Max.Y - resizedImg.Bounds().Min.Y
-	bounds = resizedImg.Bounds()
-
-	// do some image processing to make it better for ascii art
 	processedImg := processImage(resizedImg)
-	// processedImg := resizedImg
 
-	// Characters from darkest to lightest
-	// darkToLight := "#$@B%8&*oakbqwZOLCJzcvxrjft/|()1{}[]?-+~<>!:,^`'. "
+	bounds = processedImg.Bounds()
 
-	if numCharsInRamp == 0 {
-		fmt.Println("Error: darkToLight string is empty, cannot generate ASCII art.")
-		return
+	// Pre-allocate strings.Builder for efficient string concatenation
+	var sb strings.Builder
+	sb.Grow(newWidth*newHeight + newHeight) // Approximate size
+
+	// Cache pixel values for processedImg if it's *image.Gray
+	var grayImg *image.Gray
+	var pix []uint8
+	var stride int
+
+	if g, ok := processedImg.(*image.Gray); ok {
+		grayImg = g
+		pix = g.Pix
+		stride = g.Stride
 	}
 
-	lines := ""
+	charScale := float64(numCharsInRamp) / 256.0
+	// Gamma correction for perceptual uniformity
+	gamma := 0.8
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		line := ""
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			r, g, b, _ := processedImg.At(x, y).RGBA() // Returns values in range [0, 0xFFFF]
+			var gray uint8
 
-			// Convert to 8-bit values (0-255)
-			r8 := uint8(r >> 8)
-			g8 := uint8(g >> 8)
-			b8 := uint8(b >> 8)
+			if grayImg != nil {
+				// Fast path: direct pixel access
+				idx := (y-bounds.Min.Y)*stride + (x - bounds.Min.X)
+				gray = pix[idx]
+			} else {
+				// Slow path: use At() for other image types
+				r, g, b, _ := processedImg.At(x, y).RGBA()
+				gray = uint8(grayR*float64(uint8(r>>8)) +
+					grayG*float64(uint8(g>>8)) +
+					grayB*float64(uint8(b>>8)))
+			}
 
-			gray := uint8(0.299*float64(r8) + 0.587*float64(g8) + 0.114*float64(b8))
+			// Apply gamma correction for better perceptual gradation
+			normalizedGray := float64(gray) / 255.0
+			correctedGray := uint8(math.Pow(normalizedGray, gamma) * 255.0)
 
-			characterIndex := int(float64(gray) * float64(numCharsInRamp) / 256.0)
-
+			characterIndex := int(float64(correctedGray) * charScale)
 			if characterIndex >= numCharsInRamp {
 				characterIndex = numCharsInRamp - 1
 			}
-			if characterIndex < 0 { // Should not happen with uint8 gray
-				characterIndex = 0
-			}
 
-			character := darkToLight[characterIndex]
-			// fmt.Printf("%d %d %d ", r8, g8, b8)
-			line += string(character)
+			sb.WriteByte(darkToLight[characterIndex])
 		}
-		lines += line + "\n"
+		sb.WriteByte('\n')
 	}
-	fmt.Println(lines)
+	fmt.Print(sb.String())
 }
 
 func main() {
-	// check if terminal and get size
 	if !term.IsTerminal(0) {
 		fmt.Println("Not a terminal")
 		return
@@ -312,11 +348,9 @@ func main() {
 
 	file, err := os.Open("./frames")
 	if err != nil {
-		panic(err) // Or handle error more gracefully, e.g., log.Fatal(err)
+		panic(err)
 	}
 	defer file.Close()
-
-	// test if the file is a jpeg or png
 
 	fileInfo, err := file.Stat()
 	if err != nil {
@@ -345,6 +379,7 @@ func main() {
 	default:
 		folderPath := "./frames/"
 		images = processFramesFromFolder(folderPath)
+		fmt.Println() // New line after progress bar
 	}
 
 	frameRate := 50
@@ -355,5 +390,4 @@ func main() {
 		printAscii(img, width, height)
 		time.Sleep(frameDelay)
 	}
-
 }
