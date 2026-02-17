@@ -226,8 +226,10 @@ func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
 			return
 		}
 
-		// Run ffmpeg and capture output
+		// Start ffmpeg in background
 		cmd := exec.Command("ffmpeg",
+			"-hide_banner",
+			"-loglevel", "error",
 			"-i", videoPath,
 			"-vf", "fps=30,scale=480:-1:flags=lanczos",
 			"-pix_fmt", "yuvj420p",
@@ -235,37 +237,33 @@ func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
 			framePattern,
 		)
 
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ffmpeg error: %v\nOutput: %s\n", err, string(output))
-			errChan <- fmt.Errorf("ffmpeg failed: %w", err)
+		if err := cmd.Start(); err != nil {
+			errChan <- fmt.Errorf("failed to start ffmpeg: %w", err)
 			return
 		}
 
-		fmt.Printf("Extraction complete. Output: %s\n", string(output))
-
-		// List files in frames directory
-		files, err := os.ReadDir(framesDir)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to read frames directory: %w", err)
-			return
-		}
-		fmt.Printf("Found %d files in frames directory\n", len(files))
+		// Give ffmpeg time to start extracting
+		time.Sleep(200 * time.Millisecond)
 
 		frameNum := 1
 		consecutiveEmpty := 0
-		maxConsecutiveEmpty := 10
+		maxConsecutiveEmpty := 30 // Allow more retries since ffmpeg is running
 
 		for {
 			framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%05d.jpg", frameNum))
 
+			// Check if frame exists and is readable
 			if _, err := os.Stat(framePath); err == nil {
+				// Frame exists, try to load it
 				f, err := os.Open(framePath)
 				if err != nil {
 					consecutiveEmpty++
 				} else {
 					img, _, err := image.Decode(f)
 					f.Close()
+					// Remove frame after reading to save space
+					os.Remove(framePath)
+
 					if err != nil {
 						consecutiveEmpty++
 					} else {
@@ -279,21 +277,28 @@ func streamYouTubeFrames(videoPath string) (<-chan image.Image, chan error) {
 				consecutiveEmpty++
 			}
 
+			// Check if ffmpeg has finished
 			if cmd.Process != nil {
+				// Try to check if process is still running
 				if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+					// Process has exited
 					if consecutiveEmpty > maxConsecutiveEmpty {
+						// Wait a bit more then break
+						time.Sleep(100 * time.Millisecond)
 						break
 					}
 				}
 			}
 
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 
-			if consecutiveEmpty > maxConsecutiveEmpty*3 {
+			if consecutiveEmpty > maxConsecutiveEmpty*5 {
 				break
 			}
 		}
 
+		// Cleanup remaining frames
+		os.RemoveAll(framesDir)
 		cmd.Wait()
 	}()
 
