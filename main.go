@@ -156,8 +156,6 @@ func processFramesFromFolder(folderPath string) []image.Image {
 
 func processImage(img image.Image) image.Image {
 	bounds := img.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
 
 	// Convert to grayscale
 	grayImg := image.NewGray(bounds)
@@ -181,15 +179,12 @@ func processImage(img image.Image) image.Image {
 		}
 	}
 
-	// Create output image
-	edgeImg := image.NewGray(bounds)
-
+	// If flat image, return grayscale as-is
 	if minGray == maxGray {
-		// Flat image - return as-is
-		return edgeImg
+		return grayImg
 	}
 
-	// Apply contrast enhancement and Sobel in fewer passes
+	// Apply contrast enhancement for better ASCII representation
 	contrastImg := image.NewGray(bounds)
 	contrastPA := newPixelAccessor(contrastImg)
 
@@ -204,78 +199,33 @@ func processImage(img image.Image) image.Image {
 		}
 	}
 
-	// Optimized Sobel with single-pass normalization
-	edgePA := newPixelAccessor(edgeImg)
-
-	sobelX := [3][3]int{{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}}
-	sobelY := [3][3]int{{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}}
-
-	// Use flat slice for better cache locality
-	magnitudes := make([]float64, (width-2)*(height-2))
-	maxMagnitude := 0.0
-
-	idx := 0
-	for y := bounds.Min.Y + 1; y < bounds.Max.Y-1; y++ {
-		for x := bounds.Min.X + 1; x < bounds.Max.X-1; x++ {
-			var gx, gy float64
-
-			// Unrolled kernel loops for better performance
-			for ky := -1; ky <= 1; ky++ {
-				for kx := -1; kx <= 1; kx++ {
-					pixelVal := float64(contrastPA.at(x+kx, y+ky))
-					gx += pixelVal * float64(sobelX[ky+1][kx+1])
-					gy += pixelVal * float64(sobelY[ky+1][kx+1])
-				}
-			}
-
-			magnitude := math.Sqrt(gx*gx + gy*gy)
-			magnitudes[idx] = magnitude
-			if magnitude > maxMagnitude {
-				maxMagnitude = magnitude
-			}
-			idx++
-		}
-	}
-
-	// Normalize and write in single pass
-	if maxMagnitude > 0 {
-		normalizeScale := maxUint8 / maxMagnitude
-		idx = 0
-		for y := bounds.Min.Y + 1; y < bounds.Max.Y-1; y++ {
-			for x := bounds.Min.X + 1; x < bounds.Max.X-1; x++ {
-				normalizedVal := magnitudes[idx] * normalizeScale
-				if normalizedVal > maxUint8 {
-					normalizedVal = maxUint8
-				}
-				edgePA.set(x, y, uint8(normalizedVal))
-				idx++
-			}
-		}
-	}
-
-	return edgeImg
+	return contrastImg
 }
 
 func printAscii(img image.Image, width, height int) {
 	// Better character ramp with more shades for smoother gradients
 	// From darkest to lightest: solid block -> detailed characters -> space
-	darkToLight := "@%#*+=-:. "
+	darkToLight := "@#%*+=-:. "
 	numCharsInRamp := len(darkToLight)
 
 	bounds := img.Bounds()
 	imgWidth := bounds.Dx()
 	imgHeight := bounds.Dy()
 
-	// Account for terminal character aspect ratio (characters are ~2x taller than wide)
-	// This prevents the image from looking stretched vertically
-	charAspectRatio := 0.5
-	aspectRatio := float64(imgWidth) / float64(imgHeight) * charAspectRatio
+	// Calculate target dimensions to fill terminal while preserving aspect ratio
+	// Terminal chars are ~2x taller than wide, so we compensate
+	charAspectRatio := 2.0 // height/width of a terminal character
+	imageAspectRatio := float64(imgWidth) / float64(imgHeight)
+
+	// Scale image to fit within terminal, accounting for character aspect ratio
+	scaledAspectRatio := imageAspectRatio / charAspectRatio
+
 	newWidth := width
-	newHeight := int(float64(newWidth) / aspectRatio)
+	newHeight := int(float64(newWidth) / scaledAspectRatio)
 
 	if newHeight > height {
 		newHeight = height
-		newWidth = int(float64(newHeight) * aspectRatio)
+		newWidth = int(float64(newHeight) * scaledAspectRatio)
 	}
 
 	resizedImg := resizeImage(img, newWidth, newHeight)
@@ -335,16 +285,18 @@ func printAscii(img image.Image, width, height int) {
 }
 
 func main() {
-	if !term.IsTerminal(0) {
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		fmt.Println("Not a terminal")
 		return
 	}
 
-	width, height, err := term.GetSize(0)
+	width, height, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Width: %d, Height: %d\n", width, height)
+	// Reserve 1 line for status/debug output
+	height = height - 1
+	fmt.Printf("Terminal: %dx%d\n", width, height)
 
 	file, err := os.Open("./frames")
 	if err != nil {
