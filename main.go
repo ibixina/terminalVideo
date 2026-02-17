@@ -173,7 +173,7 @@ func extractFramesFromVideo(videoPath string) (string, error) {
 
 	cmd := exec.Command("ffmpeg",
 		"-i", videoPath,
-		"-vf", "fps=30,scale=480:-1:flags=lanczos",
+		"-vf", "fps=30,scale=1280:-1:flags=lanczos",
 		"-q:v", "2",
 		framePattern,
 	)
@@ -286,16 +286,16 @@ func processImage(img image.Image) image.Image {
 	// Convert to grayscale
 	grayImg := image.NewGray(bounds)
 	draw.Draw(grayImg, grayImg.Bounds(), img, img.Bounds().Min, draw.Src)
-
-	// Single-pass contrast enhancement with min/max tracking
 	pa := newPixelAccessor(grayImg)
 
+	// Calculate histogram for percentile-based contrast
+	var histogram [256]int
 	var minGray, maxGray uint8 = maxUint8, 0
 
-	// Find min/max in one pass
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			g := pa.at(x, y)
+			histogram[g]++
 			if g < minGray {
 				minGray = g
 			}
@@ -310,18 +310,65 @@ func processImage(img image.Image) image.Image {
 		return grayImg
 	}
 
-	// Apply contrast enhancement for better ASCII representation
+	// Use percentile-based clipping for better contrast (ignore extreme 2%)
+	totalPixels := (bounds.Max.X - bounds.Min.X) * (bounds.Max.Y - bounds.Min.Y)
+	clipPercent := int(float64(totalPixels) * 0.02)
+
+	// Find 2nd percentile (new min)
+	cumsum := 0
+	newMin := uint8(0)
+	for i := 0; i < 256; i++ {
+		cumsum += histogram[i]
+		if cumsum >= clipPercent {
+			newMin = uint8(i)
+			break
+		}
+	}
+
+	// Find 98th percentile (new max)
+	cumsum = 0
+	newMax := uint8(255)
+	for i := 255; i >= 0; i-- {
+		cumsum += histogram[i]
+		if cumsum >= clipPercent {
+			newMax = uint8(i)
+			break
+		}
+	}
+
+	if newMax <= newMin {
+		newMin = minGray
+		newMax = maxGray
+	}
+
+	// Apply contrast enhancement with brightness boost
 	contrastImg := image.NewGray(bounds)
 	contrastPA := newPixelAccessor(contrastImg)
 
-	scaleFactor := float64(maxUint8) / float64(maxGray-minGray)
+	scaleFactor := float64(maxUint8) / float64(newMax-newMin)
+	brightnessBoost := 1.1 // Slight brightness increase
 
-	// Single pass: contrast enhancement
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			originalGray := pa.at(x, y)
-			stretchedGray := uint8(float64(originalGray-minGray) * scaleFactor)
-			contrastPA.set(x, y, stretchedGray)
+
+			// Contrast stretch with clipping
+			var stretched float64
+			if originalGray < newMin {
+				stretched = 0
+			} else if originalGray > newMax {
+				stretched = 255
+			} else {
+				stretched = float64(originalGray-newMin) * scaleFactor
+			}
+
+			// Apply brightness boost
+			stretched = stretched * brightnessBoost
+			if stretched > 255 {
+				stretched = 255
+			}
+
+			contrastPA.set(x, y, uint8(stretched))
 		}
 	}
 
@@ -329,9 +376,10 @@ func processImage(img image.Image) image.Image {
 }
 
 func printAscii(img image.Image, width, height int) {
-	// Better character ramp with more shades for smoother gradients
-	// From darkest to lightest: solid block -> detailed characters -> space
-	darkToLight := "@#%*+=-:. "
+	// Improved character ramp with 16 levels for better detail
+	// Ordered from darkest (solid) to lightest (empty)
+	// Unicode block characters + ASCII for maximum compatibility
+	darkToLight := "@#%&*+=-;:,. "
 	numCharsInRamp := len(darkToLight)
 
 	bounds := img.Bounds()
@@ -393,8 +441,8 @@ func printAscii(img image.Image, width, height int) {
 	}
 
 	charScale := float64(numCharsInRamp) / 256.0
-	// Gamma correction for perceptual uniformity
-	gamma := 0.8
+	// Gamma correction: 0.85 brightens mid-tones slightly for better visibility
+	gamma := 0.85
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
