@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"image"
 	"image/draw"
@@ -285,6 +286,16 @@ func printAscii(img image.Image, width, height int) {
 }
 
 func main() {
+	// Parse command line arguments
+	var inputPath string
+	flag.StringVar(&inputPath, "i", "./frames", "Input path (image file or directory)")
+	flag.Parse()
+
+	// If positional argument provided, use it as input path
+	if len(flag.Args()) > 0 {
+		inputPath = flag.Args()[0]
+	}
+
 	if !term.IsTerminal(int(os.Stdout.Fd())) {
 		fmt.Println("Not a terminal")
 		return
@@ -296,42 +307,59 @@ func main() {
 	}
 	// Reserve 1 line for status/debug output
 	height = height - 1
-	fmt.Printf("Terminal: %dx%d\n", width, height)
+	fmt.Printf("Terminal: %dx%d | Input: %s\n", width, height, inputPath)
 
-	file, err := os.Open("./frames")
+	// Check if input is a file or directory
+	fileInfo, err := os.Stat(inputPath)
 	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-
-	fileInfo, err := file.Stat()
-	if err != nil {
-		panic(err)
+		fmt.Printf("Error: cannot access '%s': %v\n", inputPath, err)
+		os.Exit(1)
 	}
 
-	ext := strings.ToLower(filepath.Ext(fileInfo.Name()))
-	var img image.Image
 	var images []image.Image
 
-	switch ext {
-	case ".jpg", ".jpeg":
-		img, err = jpeg.Decode(file)
-		if err != nil {
-			panic(err)
-		}
-		images = append(images, img)
-		fmt.Println("It's a JPEG")
-	case ".png":
-		img, err = png.Decode(file)
-		if err != nil {
-			panic(err)
-		}
-		images = append(images, img)
-		fmt.Println("It's a PNG")
-	default:
-		folderPath := "./frames/"
-		images = processFramesFromFolder(folderPath)
+	if fileInfo.IsDir() {
+		// Process directory of frames
+		images = processFramesFromFolder(inputPath)
 		fmt.Println() // New line after progress bar
+	} else {
+		// Process single file
+		ext := strings.ToLower(filepath.Ext(inputPath))
+		switch ext {
+		case ".jpg", ".jpeg":
+			file, err := os.Open(inputPath)
+			if err != nil {
+				panic(err)
+			}
+			defer file.Close()
+			img, err := jpeg.Decode(file)
+			if err != nil {
+				panic(err)
+			}
+			images = append(images, img)
+			fmt.Println("Loaded JPEG")
+		case ".png":
+			file, err := os.Open(inputPath)
+			if err != nil {
+				panic(err)
+			}
+			defer file.Close()
+			img, err := png.Decode(file)
+			if err != nil {
+				panic(err)
+			}
+			images = append(images, img)
+			fmt.Println("Loaded PNG")
+		default:
+			fmt.Printf("Error: unsupported file format '%s'\n", ext)
+			fmt.Println("Supported formats: .jpg, .jpeg, .png")
+			os.Exit(1)
+		}
+	}
+
+	if len(images) == 0 {
+		fmt.Println("No images to display")
+		return
 	}
 
 	frameRate := 50
