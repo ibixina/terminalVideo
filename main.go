@@ -225,7 +225,11 @@ func streamVideoFrames(videoPath string) (<-chan image.Image, chan error) {
 			return
 		}
 
-		// Wait for first frame to appear, then start streaming
+		// Wait for ffmpeg to finish in background
+		go func() {
+			cmd.Wait()
+		}()
+
 		frameNum := 1
 		consecutiveEmpty := 0
 		maxConsecutiveEmpty := 10 // Stop after 10 empty checks after ffmpeg exits
@@ -492,9 +496,13 @@ func main() {
 		return
 	}
 
-	width, height, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		panic(err)
+	width, height := 80, 24
+	var err error
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		width, height, err = term.GetSize(int(os.Stdout.Fd()))
+		if err != nil {
+			panic(err)
+		}
 	}
 	// Reserve 1 line for status/debug output
 	height = height - 1
