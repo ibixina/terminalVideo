@@ -176,12 +176,18 @@ func streamYouTubeFramesFromStream(stream io.ReadCloser) (<-chan image.Image, ch
 	imgChan := make(chan image.Image, 30)
 	errChan := make(chan error, 1)
 
+	framesDir := "./youtube_frames"
+
+	// Clean up any remnants from previous run
+	if err := os.RemoveAll(framesDir); err != nil {
+		fmt.Printf("Warning: failed to clean up previous frames: %v\n", err)
+	}
+
 	go func() {
 		defer close(imgChan)
 		defer close(errChan)
 
 		// Create frames directory in current working directory
-		framesDir := "./youtube_frames"
 		err := os.MkdirAll(framesDir, 0755)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to create frames directory: %w", err)
